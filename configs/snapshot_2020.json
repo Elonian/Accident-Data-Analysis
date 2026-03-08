@@ -1,0 +1,19 @@
+{
+  "dataset_name": "snapshot_2020",
+  "source_csv": "/mntdatalora/src/Accident-Data-Analysis/data/NYC Accidents 2020.csv",
+  "canonical_csv": "/mntdatalora/src/Accident-Data-Analysis/outputs/snapshot_2020/tables/canonical_dataset.csv",
+  "feature_csv": "/mntdatalora/src/Accident-Data-Analysis/outputs/snapshot_2020/tables/feature_table.csv",
+  "reports_dir": "/mntdatalora/src/Accident-Data-Analysis/outputs/snapshot_2020/reports",
+  "tables_dir": "/mntdatalora/src/Accident-Data-Analysis/outputs/snapshot_2020/tables",
+  "models_dir": "/mntdatalora/src/Accident-Data-Analysis/outputs/snapshot_2020/models",
+  "visualizations_dir": "/mntdatalora/src/Accident-Data-Analysis/visualizations/snapshot_2020",
+  "random_seed": "143",
+  "max_rows_for_model": "250000",
+  "cluster_sample_limit": "120000",
+  "plot_sample_limit": "60000",
+  "n_spatial_clusters": "45",
+  "cluster_plot_limit": "200000",
+  "cluster_fit_batch_size": "12000",
+  "cluster_predict_batch_size": "4000",
+  "cluster_top_n": "30"
+}

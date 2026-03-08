@@ -1,0 +1,19 @@
+{
+  "dataset_name": "full_multiyear",
+  "source_csv": "/mntdatalora/src/Accident-Data-Analysis/data/NYC_Collisions_Official_full.csv",
+  "canonical_csv": "/mntdatalora/src/Accident-Data-Analysis/outputs/full_multiyear/tables/canonical_dataset.csv",
+  "feature_csv": "/mntdatalora/src/Accident-Data-Analysis/outputs/full_multiyear/tables/feature_table.csv",
+  "reports_dir": "/mntdatalora/src/Accident-Data-Analysis/outputs/full_multiyear/reports",
+  "tables_dir": "/mntdatalora/src/Accident-Data-Analysis/outputs/full_multiyear/tables",
+  "models_dir": "/mntdatalora/src/Accident-Data-Analysis/outputs/full_multiyear/models",
+  "visualizations_dir": "/mntdatalora/src/Accident-Data-Analysis/visualizations/full_multiyear",
+  "random_seed": "143",
+  "max_rows_for_model": "250000",
+  "cluster_sample_limit": "2500000",
+  "plot_sample_limit": "60000",
+  "n_spatial_clusters": "140",
+  "cluster_plot_limit": "250000",
+  "cluster_fit_batch_size": "25000",
+  "cluster_predict_batch_size": "12000",
+  "cluster_top_n": "40"
+}
