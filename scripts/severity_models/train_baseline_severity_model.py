@@ -257,6 +257,78 @@ def train_with_sklearn(train_rows: List[Dict[str, str]], test_rows: List[Dict[st
     return "sklearn_logistic", metrics, prediction_rows, curve_data
 
 
+def train_tree_benchmark(
+    train_rows: List[Dict[str, str]], test_rows: List[Dict[str, str]], seed: int
+) -> Tuple[str, Dict[str, float], List[Dict[str, str]], Dict[str, object]]:
+    """Train RandomForest benchmark with same split/target/metrics.
+
+    Args:
+        train_rows: Training rows.
+        test_rows: Testing rows.
+        seed: Random seed.
+
+    Returns:
+        Tuple[str, Dict[str, float], List[Dict[str, str]], Dict[str, object]]: Method, metrics, prediction rows, and curve data.
+
+    Raises:
+        ImportError: If sklearn or numpy is not installed.
+    """
+    import numpy as np  # type: ignore
+    from sklearn.calibration import calibration_curve  # type: ignore
+    from sklearn.ensemble import RandomForestClassifier  # type: ignore
+    from sklearn.metrics import auc, precision_recall_curve, roc_curve  # type: ignore
+
+    x_train = np.array([build_feature_vector(row) for row in train_rows], dtype=float)
+    y_train = np.array([get_target(row) for row in train_rows], dtype=int)
+    x_test = np.array([build_feature_vector(row) for row in test_rows], dtype=float)
+    y_test = np.array([get_target(row) for row in test_rows], dtype=int)
+
+    model = RandomForestClassifier(
+        n_estimators=300,
+        random_state=seed,
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+    )
+    model.fit(x_train, y_train)
+
+    prob = model.predict_proba(x_test)[:, 1]
+    pred = (prob >= 0.5).astype(int)
+    metrics = evaluate_predictions(y_test.tolist(), pred.tolist())
+
+    fpr, tpr, _ = roc_curve(y_test, prob)
+    precision_curve, recall_curve, _ = precision_recall_curve(y_test, prob)
+    roc_auc = auc(fpr, tpr)
+    pr_auc = auc(recall_curve, precision_curve)
+
+    frac_pos, mean_pred = calibration_curve(y_test, prob, n_bins=10)
+
+    prediction_rows: List[Dict[str, str]] = []
+    for row, p_score, p_label, actual in zip(test_rows, prob.tolist(), pred.tolist(), y_test.tolist()):
+        prediction_rows.append(
+            {
+                "COLLISION_ID": row.get("COLLISION_ID", ""),
+                "CRASH DATE": row.get("CRASH DATE", ""),
+                "predicted_probability": f"{float(p_score):.6f}",
+                "predicted_label": str(int(p_label)),
+                "actual_label": str(int(actual)),
+            }
+        )
+
+    metrics["roc_auc"] = float(roc_auc)
+    metrics["pr_auc"] = float(pr_auc)
+
+    curve_data: Dict[str, object] = {
+        "roc_fpr": fpr.tolist(),
+        "roc_tpr": tpr.tolist(),
+        "pr_recall": recall_curve.tolist(),
+        "pr_precision": precision_curve.tolist(),
+        "calibration_mean_pred": mean_pred.tolist(),
+        "calibration_frac_pos": frac_pos.tolist(),
+    }
+
+    return "tree_random_forest", metrics, prediction_rows, curve_data
+
+
 def train_rule_baseline(test_rows: List[Dict[str, str]]) -> Tuple[str, Dict[str, float], List[Dict[str, str]], Dict[str, object]]:
     """Run rule-based fallback model when sklearn is unavailable.
 
@@ -312,7 +384,7 @@ def train_rule_baseline(test_rows: List[Dict[str, str]]) -> Tuple[str, Dict[str,
     return "rule_baseline", metrics, prediction_rows, curve_data
 
 
-def save_model_plots(method: str, curve_data: Dict[str, object], visual_root: Path) -> List[str]:
+def save_model_plots(method: str, curve_data: Dict[str, object], visual_root: Path, filename_prefix: str = "") -> List[str]:
     """Save model performance plots.
 
     Args:
@@ -350,7 +422,7 @@ def save_model_plots(method: str, curve_data: Dict[str, object], visual_root: Pa
         plt.xlabel("False Positive Rate")
         plt.ylabel("True Positive Rate")
         plt.tight_layout()
-        plt.savefig(models_dir / "roc_curve.png")
+        plt.savefig(models_dir / f"{filename_prefix}roc_curve.png")
         plt.close()
         messages.append("Created ROC curve plot.")
 
@@ -360,7 +432,7 @@ def save_model_plots(method: str, curve_data: Dict[str, object], visual_root: Pa
         plt.xlabel("Recall")
         plt.ylabel("Precision")
         plt.tight_layout()
-        plt.savefig(models_dir / "precision_recall_curve.png")
+        plt.savefig(models_dir / f"{filename_prefix}precision_recall_curve.png")
         plt.close()
         messages.append("Created precision-recall curve plot.")
 
@@ -371,7 +443,7 @@ def save_model_plots(method: str, curve_data: Dict[str, object], visual_root: Pa
         plt.xlabel("Mean Predicted Probability")
         plt.ylabel("Observed Positive Rate")
         plt.tight_layout()
-        plt.savefig(models_dir / "calibration_curve.png")
+        plt.savefig(models_dir / f"{filename_prefix}calibration_curve.png")
         plt.close()
         messages.append("Created calibration curve plot.")
     else:
@@ -433,6 +505,114 @@ def main() -> None:
     write_csv_rows(tables_dir / "severity_model_metrics.csv", ["metric", "value"], metrics_rows)
 
     plot_messages = save_model_plots(method, curve_data, visual_root)
+
+    benchmark_method = "tree_random_forest"
+    benchmark_metrics: Dict[str, float] = {}
+    benchmark_predictions: List[Dict[str, str]] = []
+    benchmark_plot_messages: List[str] = []
+    benchmark_status = "not_run"
+    try:
+        benchmark_method, benchmark_metrics, benchmark_predictions, benchmark_curve_data = train_tree_benchmark(
+            train_rows,
+            test_rows,
+            seed=seed,
+        )
+        benchmark_status = "ok"
+        benchmark_plot_messages = save_model_plots(
+            "sklearn_logistic",
+            benchmark_curve_data,
+            visual_root,
+            filename_prefix="tree_random_forest_",
+        )
+    except ImportError:
+        benchmark_status = "skipped_missing_sklearn_or_numpy"
+
+    if benchmark_status == "ok":
+        write_csv_rows(
+            tables_dir / "severity_model_predictions_sample_tree_random_forest.csv",
+            ["COLLISION_ID", "CRASH DATE", "predicted_probability", "predicted_label", "actual_label"],
+            benchmark_predictions[:1000],
+        )
+
+        tree_metrics_rows = [{"metric": key, "value": f"{value:.6f}"} for key, value in benchmark_metrics.items()]
+        write_csv_rows(tables_dir / "severity_model_metrics_tree_random_forest.csv", ["metric", "value"], tree_metrics_rows)
+
+        comparison_rows: List[Dict[str, str]] = []
+        metric_order = list(metrics.keys())
+        for metric_name in metric_order:
+            logistic_value = float(metrics.get(metric_name, 0.0))
+            tree_value = float(benchmark_metrics.get(metric_name, 0.0))
+            comparison_rows.append(
+                {
+                    "metric": metric_name,
+                    "logistic": f"{logistic_value:.6f}",
+                    "tree_random_forest": f"{tree_value:.6f}",
+                    "delta_tree_minus_logistic": f"{(tree_value - logistic_value):.6f}",
+                }
+            )
+
+        write_csv_rows(
+            tables_dir / "severity_model_benchmark_comparison.csv",
+            ["metric", "logistic", "tree_random_forest", "delta_tree_minus_logistic"],
+            comparison_rows,
+        )
+
+        benchmark_lines = [
+            f"Dataset: {config.get('dataset_name', 'unknown')}",
+            "Benchmark setup:",
+            "- Baseline model: sklearn_logistic",
+            f"- Tree benchmark model: {benchmark_method}",
+            "- Shared target: ANY_INJURY",
+            "- Shared train/test split source: sample_train_test_rows in train_baseline_severity_model.py",
+            f"- Train rows used: {len(train_rows)}",
+            f"- Test rows used: {len(test_rows)}",
+            "",
+            "Logistic baseline metrics:",
+        ]
+        for key, value in metrics.items():
+            benchmark_lines.append(f"- {key}: {value:.6f}")
+        benchmark_lines.append("")
+        benchmark_lines.append("RandomForest benchmark metrics:")
+        for key, value in benchmark_metrics.items():
+            benchmark_lines.append(f"- {key}: {value:.6f}")
+        benchmark_lines.append("")
+        benchmark_lines.append("Delta (tree - logistic):")
+        for metric_name in metric_order:
+            delta = float(benchmark_metrics.get(metric_name, 0.0)) - float(metrics.get(metric_name, 0.0))
+            benchmark_lines.append(f"- {metric_name}: {delta:.6f}")
+        benchmark_lines.append("")
+        benchmark_lines.append("Tree plot status:")
+        for message in benchmark_plot_messages:
+            benchmark_lines.append(f"- {message}")
+        benchmark_lines.append("")
+        benchmark_lines.append("Tree output artifacts:")
+        benchmark_lines.append("- severity_model_predictions_sample_tree_random_forest.csv")
+        benchmark_lines.append("- severity_model_metrics_tree_random_forest.csv")
+        benchmark_lines.append("- severity_model_benchmark_comparison.csv")
+        benchmark_lines.append("- tree_random_forest_roc_curve.png")
+        benchmark_lines.append("- tree_random_forest_precision_recall_curve.png")
+        benchmark_lines.append("- tree_random_forest_calibration_curve.png")
+
+        write_markdown(
+            reports_dir / "severity_model_benchmark_report.md",
+            "Severity Model Benchmark Report",
+            benchmark_lines,
+        )
+    else:
+        write_markdown(
+            reports_dir / "severity_model_benchmark_report.md",
+            "Severity Model Benchmark Report",
+            [
+                f"Dataset: {config.get('dataset_name', 'unknown')}",
+                "Benchmark setup:",
+                "- Baseline model: sklearn_logistic",
+                "- Tree benchmark model: tree_random_forest",
+                "- Shared target: ANY_INJURY",
+                "",
+                f"Tree benchmark status: {benchmark_status}",
+                "Tree-specific outputs were not generated.",
+            ],
+        )
 
     report_lines = [
         f"Dataset: {config.get('dataset_name', 'unknown')}",
