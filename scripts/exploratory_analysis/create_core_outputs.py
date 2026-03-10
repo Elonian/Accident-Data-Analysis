@@ -66,6 +66,8 @@ def aggregate_feature_data(feature_csv: Path) -> Dict[str, object]:
     factor_counts: Counter[str] = Counter()
     borough_counts: Counter[str] = Counter()
     day_hour_counts: Dict[str, Counter[str]] = defaultdict(Counter)
+    collision_types: Counter[str] = Counter()
+    collision_types_fatal: Counter[str] = Counter()
 
     row_count = 0
 
@@ -80,6 +82,9 @@ def aggregate_feature_data(feature_csv: Path) -> Dict[str, object]:
             borough = (row.get("BOROUGH") or "").strip() or "UNKNOWN"
             vehicle = (row.get("VEHICLE TYPE CODE 1") or "").strip() or "UNKNOWN"
             factor = (row.get("CONTRIBUTING FACTOR VEHICLE 1") or "").strip() or "UNKNOWN"
+            on_street = (row.get("ON STREET NAME") or "").strip()
+            cross_street_name = (row.get("CROSS STREET NAME") or "").strip()
+            off_street = (row.get("OFF STREET NAME") or "").strip()
 
             fatal = to_int(row.get("FATAL_COLLISION", "0"))
 
@@ -92,6 +97,18 @@ def aggregate_feature_data(feature_csv: Path) -> Dict[str, object]:
                 weekday_collisions[weekday] += 1
                 if hour:
                     day_hour_counts[weekday][hour] += 1
+            
+            if on_street and cross_street_name:
+                context = "INTERSECTION"
+            elif on_street and not cross_street_name:
+                context = "MIDBLOCK"
+            elif off_street:
+                context = "OFF_STREET"
+            else:
+                context = "UNKNOWN"
+
+            collision_types[context] += 1
+            collision_types_fatal[context] += fatal
 
             borough_counts[borough] += 1
             vehicle_counts[vehicle] += 1
@@ -107,6 +124,8 @@ def aggregate_feature_data(feature_csv: Path) -> Dict[str, object]:
         "factor_counts": factor_counts,
         "borough_counts": borough_counts,
         "day_hour_counts": day_hour_counts,
+        "collision_types": collision_types,
+        "collision_types_fatal": collision_types_fatal,
     }
 
 
@@ -131,6 +150,8 @@ def write_core_tables(aggregates: Dict[str, object], tables_dir: Path) -> None:
     vehicle_counts: Counter = aggregates["vehicle_counts"]  # type: ignore[assignment]
     factor_counts: Counter = aggregates["factor_counts"]  # type: ignore[assignment]
     borough_counts: Counter = aggregates["borough_counts"]  # type: ignore[assignment]
+    collision_types: Counter = aggregates["collision_types"]
+    collision_types_fatal: Counter = aggregates["collision_types_fatal"]
 
     monthly_rows: List[Dict[str, str]] = []
     for month in sorted(monthly_collisions):
@@ -161,12 +182,24 @@ def write_core_tables(aggregates: Dict[str, object], tables_dir: Path) -> None:
         {"borough": name, "collisions": str(count)} for name, count in borough_counts.most_common()
     ]
 
+    context_rows = []
+    for context in sorted(collision_types):
+        collisions = collision_types[context]
+        fatals = collision_types_fatal[context]
+        context_rows.append(
+            {
+                "collision location": context,
+                "collisions": str(collisions),
+                "fatal_collisions": str(fatals),
+                "fatal_rate_percent": f"{100.0 * safe_divide(fatals, collisions):.4f}",
+            }
+        )
     write_csv_rows(tables_dir / "monthly_kpi.csv", ["month", "collisions", "fatal_collisions", "fatal_rate_percent"], monthly_rows)
     write_csv_rows(tables_dir / "hourly_kpi.csv", ["hour", "collisions"], hourly_rows)
     write_csv_rows(tables_dir / "top_vehicle_types.csv", ["vehicle_type", "collisions"], top_vehicle_rows)
     write_csv_rows(tables_dir / "top_factors.csv", ["factor", "collisions"], top_factor_rows)
     write_csv_rows(tables_dir / "borough_collisions.csv", ["borough", "collisions"], borough_rows)
-
+    write_csv_rows(tables_dir / "collision_street_location_kpi.csv", ["collision location", "collisions", "fatal_collisions", "fatal_rate_percent"], context_rows)
 
 def create_core_plots(aggregates: Dict[str, object], visual_root: Path) -> List[str]:
     """Create plots and return status messages.
@@ -193,6 +226,8 @@ def create_core_plots(aggregates: Dict[str, object], visual_root: Path) -> List[
     factor_counts: Counter = aggregates["factor_counts"]  # type: ignore[assignment]
     borough_counts: Counter = aggregates["borough_counts"]  # type: ignore[assignment]
     day_hour_counts: Dict[str, Counter] = aggregates["day_hour_counts"]  # type: ignore[assignment]
+    collision_types: Counter = aggregates["collision_types"]
+    collision_types_fatal: Counter = aggregates["collision_types_fatal"]
 
     months = sorted(monthly_collisions)
     monthly_values = [float(monthly_collisions[m]) for m in months]
@@ -207,6 +242,12 @@ def create_core_plots(aggregates: Dict[str, object], visual_root: Path) -> List[
     top_vehicle = vehicle_counts.most_common(12)
     top_factors = factor_counts.most_common(12)
     top_boroughs = borough_counts.most_common()
+
+    collision_locations = sorted(collision_types.keys())
+    collision_location_values = [float(collision_types[c])/1000 for c in collision_locations]
+    collision_location_fatal_rate = [ 100.0 * safe_divide(float(collision_types_fatal[c]), float(collision_types[c]))
+    for c in collision_locations
+    ]
 
     heatmap_matrix: List[List[float]] = []
     hour_labels = [str(i) for i in range(24)]
@@ -284,6 +325,26 @@ def create_core_plots(aggregates: Dict[str, object], visual_root: Path) -> List[
             visual_root / "core" / "borough_collision_count.png",
         )
         messages.append("Created borough collision bar chart.")
+
+        save_bar_plot(
+            collision_locations,
+            collision_location_values,
+            "Collision Count by Street Locations",
+            "Collision Location",
+            "Collisions (thousands)",
+            visual_root / "core" / "collision_location_count.png",
+        )
+        messages.append("Created collision location bar chart.")
+        
+        save_bar_plot(
+            collision_locations,
+            collision_location_fatal_rate,
+            "Fatal Collision Rate by Street Location",
+            "Collision Location",
+            "Fatal Rate (%)",
+            visual_root / "core" / "collision_location_fatal_rate.png",
+        )
+        messages.append("Created collision location fatal rate bar chart.")
 
         save_heatmap(
             heatmap_matrix,
