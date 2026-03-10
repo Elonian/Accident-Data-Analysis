@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import csv
+import math
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -607,6 +608,315 @@ def build_era_hour_rows(agg: Aggregates) -> List[Dict[str, str]]:
     return output
 
 
+def build_dst_did_panel_rows(feature_csv: Path) -> List[Dict[str, str]]:
+    """Build compact aggregated DST DiD panel (season/year/pre-post/treated-control).
+
+    Args:
+        feature_csv: Feature dataset path.
+
+    Returns:
+        List[Dict[str, str]]: Aggregated panel rows.
+
+    Raises:
+        FileNotFoundError: If feature dataset does not exist.
+    """
+    if not feature_csv.exists():
+        raise FileNotFoundError(f"Feature CSV not found: {feature_csv}")
+
+    # Hour-bin assumptions for DiD setup.
+    treated_by_season = {
+        "spring": set(range(4, 9)),
+        "fall": set(range(17, 21)),
+    }
+    control_hours = set(range(10, 15))
+
+    panel_counts: Dict[Tuple[str, int, str, str], int] = Counter()
+    panel_fatals: Dict[Tuple[str, int, str, str], int] = Counter()
+
+    with feature_csv.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            crash_day = parse_crash_date(row.get("CRASH DATE", ""))
+            crash_dt = combine_date_time(row.get("CRASH DATE", ""), row.get("CRASH TIME", ""))
+            if crash_day is None or crash_dt is None:
+                continue
+
+            hour = crash_dt.hour
+            year = crash_day.year
+            dst_dates = us_dst_dates_for_year(year)
+            season = ""
+            window_side = ""
+
+            spring = dst_dates["spring"]
+            fall = dst_dates["fall"]
+            if spring - date.resolution * 7 <= crash_day <= spring - date.resolution:
+                season = "spring"
+                window_side = "pre"
+            elif spring + date.resolution <= crash_day <= spring + date.resolution * 7:
+                season = "spring"
+                window_side = "post"
+            elif fall - date.resolution * 7 <= crash_day <= fall - date.resolution:
+                season = "fall"
+                window_side = "pre"
+            elif fall + date.resolution <= crash_day <= fall + date.resolution * 7:
+                season = "fall"
+                window_side = "post"
+            else:
+                continue
+
+            if hour in treated_by_season[season]:
+                hour_group = "treated_hours"
+            elif hour in control_hours:
+                hour_group = "control_hours"
+            else:
+                continue
+
+            key = (season, year, window_side, hour_group)
+            panel_counts[key] += 1
+            panel_fatals[key] += to_int(row.get("FATAL_COLLISION", "0"))
+
+    complete_years_by_season: Dict[str, List[int]] = {"spring": [], "fall": []}
+    for season in ["spring", "fall"]:
+        years = sorted({key[1] for key in panel_counts if key[0] == season})
+        for year in years:
+            required_keys = [
+                (season, year, "pre", "treated_hours"),
+                (season, year, "post", "treated_hours"),
+                (season, year, "pre", "control_hours"),
+                (season, year, "post", "control_hours"),
+            ]
+            if any(panel_counts[key] <= 0 for key in required_keys):
+                continue
+            complete_years_by_season[season].append(year)
+
+    output: List[Dict[str, str]] = []
+    for season in ["spring", "fall"]:
+        for year in complete_years_by_season[season]:
+            for window_side in ["pre", "post"]:
+                for hour_group in ["treated_hours", "control_hours"]:
+                    key = (season, year, window_side, hour_group)
+                    collisions = panel_counts[key]
+                    fatal_collisions = panel_fatals[key]
+                    post = 1 if window_side == "post" else 0
+                    treated = 1 if hour_group == "treated_hours" else 0
+                    output.append(
+                        {
+                            "season": season,
+                            "year": str(year),
+                            "window_side": window_side,
+                            "post": str(post),
+                            "treated": str(treated),
+                            "hour_group": hour_group,
+                            "collisions": str(collisions),
+                            "fatal_collisions": str(fatal_collisions),
+                            "fatal_rate_percent": f"{100.0 * safe_divide(fatal_collisions, collisions):.6f}",
+                        }
+                    )
+
+    return output
+
+
+def run_dst_did_logistic(panel_rows: List[Dict[str, str]], season: str) -> Dict[str, str]:
+    """Fit minimal DiD-style logistic interaction for one season.
+
+    Args:
+        panel_rows: Aggregated panel rows.
+        season: Season label ("spring" or "fall").
+
+    Returns:
+        Dict[str, str]: Logistic interaction outputs.
+
+    Raises:
+        None
+    """
+    season_rows = [row for row in panel_rows if row.get("season") == season]
+    if not season_rows:
+        return {"coef_post_treated": "0.000000", "odds_ratio_post_treated": "1.000000"}
+
+    x_rows: List[List[float]] = []
+    y_rows: List[int] = []
+
+    for row in season_rows:
+        post = int(float(row.get("post", "0") or 0))
+        treated = int(float(row.get("treated", "0") or 0))
+        interaction = post * treated
+        collisions = int(float(row.get("collisions", "0") or 0))
+        fatals = int(float(row.get("fatal_collisions", "0") or 0))
+        non_fatals = max(0, collisions - fatals)
+
+        x_feature = [float(post), float(treated), float(interaction)]
+        for _ in range(fatals):
+            x_rows.append(x_feature)
+            y_rows.append(1)
+        for _ in range(non_fatals):
+            x_rows.append(x_feature)
+            y_rows.append(0)
+
+    if len(set(y_rows)) < 2:
+        return {"coef_post_treated": "0.000000", "odds_ratio_post_treated": "1.000000"}
+
+    try:
+        import numpy as np  # type: ignore
+        from sklearn.linear_model import LogisticRegression  # type: ignore
+    except ImportError:
+        return {"coef_post_treated": "0.000000", "odds_ratio_post_treated": "1.000000"}
+
+    x = np.array(x_rows, dtype=float)
+    y = np.array(y_rows, dtype=int)
+    model = LogisticRegression(max_iter=400, class_weight="balanced")
+    model.fit(x, y)
+
+    coef = float(model.coef_[0][2])
+    odds_ratio = float(math.exp(coef))
+    return {
+        "coef_post_treated": f"{coef:.6f}",
+        "odds_ratio_post_treated": f"{odds_ratio:.6f}",
+    }
+
+
+def build_dst_did_results(panel_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Build per-season DiD-style result rows using 2x2 rates + logistic interaction.
+
+    Args:
+        panel_rows: Aggregated panel rows.
+
+    Returns:
+        List[Dict[str, str]]: Season-level DiD outputs.
+
+    Raises:
+        None
+    """
+    output: List[Dict[str, str]] = []
+    for season in ["spring", "fall"]:
+        season_rows = [row for row in panel_rows if row.get("season") == season]
+        if not season_rows:
+            continue
+
+        totals: Dict[Tuple[int, int], Dict[str, int]] = {
+            (1, 0): {"collisions": 0, "fatals": 0},  # treated pre
+            (1, 1): {"collisions": 0, "fatals": 0},  # treated post
+            (0, 0): {"collisions": 0, "fatals": 0},  # control pre
+            (0, 1): {"collisions": 0, "fatals": 0},  # control post
+        }
+
+        for row in season_rows:
+            treated = int(float(row.get("treated", "0") or 0))
+            post = int(float(row.get("post", "0") or 0))
+            collisions = int(float(row.get("collisions", "0") or 0))
+            fatals = int(float(row.get("fatal_collisions", "0") or 0))
+            totals[(treated, post)]["collisions"] += collisions
+            totals[(treated, post)]["fatals"] += fatals
+
+        treated_pre_rate = 100.0 * safe_divide(totals[(1, 0)]["fatals"], totals[(1, 0)]["collisions"])
+        treated_post_rate = 100.0 * safe_divide(totals[(1, 1)]["fatals"], totals[(1, 1)]["collisions"])
+        control_pre_rate = 100.0 * safe_divide(totals[(0, 0)]["fatals"], totals[(0, 0)]["collisions"])
+        control_post_rate = 100.0 * safe_divide(totals[(0, 1)]["fatals"], totals[(0, 1)]["collisions"])
+        did_effect_pp = (treated_post_rate - treated_pre_rate) - (control_post_rate - control_pre_rate)
+
+        logistic_result = run_dst_did_logistic(panel_rows, season)
+        n_observations = sum(int(float(row.get("collisions", "0") or 0)) for row in season_rows)
+
+        output.append(
+            {
+                "season": season,
+                "n_observations": str(n_observations),
+                "treated_pre_fatal_rate_percent": f"{treated_pre_rate:.6f}",
+                "treated_post_fatal_rate_percent": f"{treated_post_rate:.6f}",
+                "control_pre_fatal_rate_percent": f"{control_pre_rate:.6f}",
+                "control_post_fatal_rate_percent": f"{control_post_rate:.6f}",
+                "did_effect_pp": f"{did_effect_pp:.6f}",
+                "coef_post_treated": logistic_result["coef_post_treated"],
+                "odds_ratio_post_treated": logistic_result["odds_ratio_post_treated"],
+            }
+        )
+
+    return output
+
+
+def save_dst_did_figure(results_rows: List[Dict[str, str]], visual_root: Path) -> None:
+    """Save simple season-level DST DiD effect chart.
+
+    Args:
+        results_rows: Season-level DiD results.
+        visual_root: Visualization root directory.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    if not results_rows:
+        return
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        return
+
+    labels = [row["season"] for row in results_rows]
+    values = [float(row["did_effect_pp"]) for row in results_rows]
+    colors = ["#1f77b4" if val >= 0 else "#d62728" for val in values]
+
+    figure, axis = plt.subplots(figsize=(8, 4))
+    axis.bar(labels, values, color=colors, alpha=0.85)
+    axis.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    axis.set_title("DST DiD Effect by Season (Fatal Rate pp)")
+    axis.set_xlabel("Season")
+    axis.set_ylabel("DiD Effect (percentage points)")
+    plt.tight_layout()
+    plt.savefig(visual_root / "core" / "dst_did_effect_multiyear.png", dpi=180)
+    plt.close(figure)
+
+
+def write_dst_did_report(results_rows: List[Dict[str, str]], reports_dir: Path) -> None:
+    """Write dedicated DST DiD regression report.
+
+    Args:
+        results_rows: Season-level DiD results.
+        reports_dir: Reports directory path.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    lines = [
+        "Scope: full multi-year DST DiD-style extension using compact aggregated panel.",
+        "Design:",
+        "- Separate season models: spring and fall.",
+        "- Outcome: fatal collision binary signal aggregated to 2x2 panel rates.",
+        "- Treated hours: spring 04-08, fall 17-20.",
+        "- Control hours: 10-14 (both seasons).",
+        "- Windows: 7-day pre and 7-day post around DST date, transition day excluded.",
+        "",
+        "Results by season:",
+    ]
+
+    for row in results_rows:
+        lines.append(f"- Season: {row['season']}")
+        lines.append(f"  n_observations: {row['n_observations']}")
+        lines.append(f"  treated_pre_fatal_rate_percent: {row['treated_pre_fatal_rate_percent']}")
+        lines.append(f"  treated_post_fatal_rate_percent: {row['treated_post_fatal_rate_percent']}")
+        lines.append(f"  control_pre_fatal_rate_percent: {row['control_pre_fatal_rate_percent']}")
+        lines.append(f"  control_post_fatal_rate_percent: {row['control_post_fatal_rate_percent']}")
+        lines.append(f"  did_effect_pp: {row['did_effect_pp']}")
+        lines.append(f"  coef_post_treated: {row['coef_post_treated']}")
+        lines.append(f"  odds_ratio_post_treated: {row['odds_ratio_post_treated']}")
+
+    lines.append("")
+    lines.append("Output artifacts:")
+    lines.append("- tables/dst_did_panel_multiyear.csv")
+    lines.append("- tables/dst_did_regression_results_multiyear.csv")
+    lines.append("- core/dst_did_effect_multiyear.png")
+
+    write_markdown(
+        reports_dir / "dst_did_regression_report.md",
+        "DST DiD Regression Report",
+        lines,
+    )
+
+
 def write_outputs(agg: Aggregates, config: Dict[str, str]) -> None:
     """Write deep-analysis tables, visuals, and report.
 
@@ -623,6 +933,7 @@ def write_outputs(agg: Aggregates, config: Dict[str, str]) -> None:
     tables_dir = Path(config["tables_dir"]).resolve()
     reports_dir = Path(config["reports_dir"]).resolve()
     visual_root = Path(config["visualizations_dir"]).resolve()
+    feature_csv = Path(config["feature_csv"]).resolve()
 
     ensure_directory(tables_dir)
     ensure_directory(reports_dir)
@@ -636,6 +947,8 @@ def write_outputs(agg: Aggregates, config: Dict[str, str]) -> None:
     vehicle_rows = build_vehicle_rows(agg)
     lethality_rows = build_lethality_rows(agg)
     dst_rows = build_dst_rows(agg)
+    dst_did_panel_rows = build_dst_did_panel_rows(feature_csv)
+    dst_did_results_rows = build_dst_did_results(dst_did_panel_rows)
     era_hour_rows = build_era_hour_rows(agg)
 
     write_csv_rows(
@@ -701,6 +1014,36 @@ def write_outputs(agg: Aggregates, config: Dict[str, str]) -> None:
         tables_dir / "era_hour_collision_matrix_multiyear.csv",
         ["era", "hour", "collisions"],
         era_hour_rows,
+    )
+    write_csv_rows(
+        tables_dir / "dst_did_panel_multiyear.csv",
+        [
+            "season",
+            "year",
+            "window_side",
+            "post",
+            "treated",
+            "hour_group",
+            "collisions",
+            "fatal_collisions",
+            "fatal_rate_percent",
+        ],
+        dst_did_panel_rows,
+    )
+    write_csv_rows(
+        tables_dir / "dst_did_regression_results_multiyear.csv",
+        [
+            "season",
+            "n_observations",
+            "treated_pre_fatal_rate_percent",
+            "treated_post_fatal_rate_percent",
+            "control_pre_fatal_rate_percent",
+            "control_post_fatal_rate_percent",
+            "did_effect_pp",
+            "coef_post_treated",
+            "odds_ratio_post_treated",
+        ],
+        dst_did_results_rows,
     )
 
     years = [row["year"] for row in year_rows]
@@ -827,6 +1170,8 @@ def write_outputs(agg: Aggregates, config: Dict[str, str]) -> None:
         "VRU Harm Type",
         visual_root / "heatmaps" / "lethality_matrix_multiyear_heatmap.png",
     )
+    save_dst_did_figure(dst_did_results_rows, visual_root)
+    write_dst_did_report(dst_did_results_rows, reports_dir)
 
     report_lines = [
         f"Dataset: {config.get('dataset_name', 'unknown')}",
